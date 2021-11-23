@@ -1,0 +1,245 @@
+---
+title: "Using Machine Learning to Classify Baseball Pitches"
+author: "Jake Greenberg, Will Moscato, and Michael Helton"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, echo=FALSE, message = FALSE}
+#plotting and exploring
+library(tidyverse) #for plotting and summarizing
+library(GGally) #for nice scatterplot matrix 
+library(ggridges) #for joy/ridge plots
+library(corrplot) #for basic correlation matrix plot
+library(naniar) #for exploring missing values
+library(pdp) #for partial dependence plots, MARS models
+library(rpart.plot) #for plotting decision trees
+library(vip) #for importance plots
+
+#making things look nice
+library(lubridate) #for nice dates
+library(knitr) #for nice tables
+library(scales) #for nice labels on graphs
+library(gridExtra) #for arranging plots
+library(broom) #for nice model output
+library(janitor) #for nice names
+
+#data
+library(ISLR) #for data
+library(moderndive) #for data
+
+#modeling
+library(rsample) #for splitting data
+library(recipes) #for keeping track of transformations
+library(caret) #for modeling
+library(leaps) #for variable selection
+library(glmnet) #for LASSO
+library(earth) #for MARS models
+library(rpart) #for decision trees
+library(randomForest) #for bagging and random forests
+
+theme_set(theme_minimal())
+```
+
+# **Research Question(s):**
+#### 1. What is the best way to classify pitches by pitch type and what are the most influential variables in determining pitch type?
+
+#### 2. Is there a reliable way to use these findings to cluster pitches in real time?
+
+```{r, echo= FALSE, warning = FALSE, message= FALSE}
+may_17_pitch <- read_csv("May_1-7_pitch.csv")
+may_8.14_pitch <- read_csv("May_8-14_pitch.csv")
+may_15.21_pitch <- read_csv("May_15-21_pitch.csv")
+may_22.28_pitch <- read_csv("May_22-28_pitch.csv")
+may_29.31_pitch_nofilter <- read_csv("May_29-31_pitch_nofilter.csv")
+```
+
+```{r, echo= FALSE, message= FALSE, warning = FALSE}
+may_all <- rbind(may_17_pitch, may_8.14_pitch, may_15.21_pitch, may_22.28_pitch, may_29.31_pitch_nofilter) 
+```
+
+```{r, echo= FALSE, message = FALSE, warning= FALSE}
+may_all_cleaned <- may_all  %>% 
+  select(pitch_type, pitch_name, release_speed, release_pos_x, release_pos_z, release_pos_y, player_name, p_throws, pfx_x, pfx_z, release_spin_rate, release_extension, home_score, away_score, plate_x, plate_z, stand) %>% 
+  mutate(release_spin_rate = as.numeric(release_spin_rate)) %>% 
+  filter(pitch_type != "EP", release_pos_z < 8, !player_name %in% c("Chris Owings", "Hernan Perez", "Victor Caratini", "Brandon Dixon", "John Ryan Murphy", "Luke Maile", "Kevin Plawecki", "Tyler White", "Pat Venditte", "Ryan Feierabend", "Charlie Culberson","Tom Murphy", "Pablo Sandoval"), release_speed > 60)
+may_all_cleaned <- na.omit(may_all_cleaned)
+may_all_cleaned$pitch_type[may_all_cleaned$pitch_type == "KC"] <- "CU"
+may_all_cleaned$pitch_type[may_all_cleaned$pitch_type == "SI"] <- "FT"
+may_all_cleaned$pitch_name[may_all_cleaned$pitch_name == "Knuckle Curve"] <- "Curveball"
+may_all_cleaned$pitch_name[may_all_cleaned$pitch_name == "Sinker"] <- "2-Seam Fastball"
+
+may_all_cleaned_l <- may_all_cleaned %>% 
+  filter(p_throws == "L")
+may_all_cleaned_r <- may_all_cleaned %>% 
+  filter(p_throws == "R")
+```
+
+
+# **Data Cleaning**
+
+#### In the data cleaning portion, we select out 17 variables: pitch_type, pitch_name, release_speed, release_pos_x, release_pos_z, release_pos_y, player_name, p_throws, pfx_x, pfx_z, release_spin_rate, release_extension, home_score, away_score, plate_x, plate_z, and stand. These variables are usseful in distinguishing between pitch types because they determine the behavior of a pitch. We made spin rate numeric, removed pitches that were classified as an Eephus or Knuckleball from the data, removed all pitches from above 8 feet tall (Dylan Covey Rule), removed pitches thrown under 60 mph and by position players. Finally, we omitted observations with omitted values, grouped similar pitches Knuckleball and Sinker into the Curveball and Two-Seam the categories, respectively. Finally, we split our cleaned dataset into two separate datasets, for lefties and righties, respectively, to account for the fact that movement profiles and their values are contingent upon pitcher handedness because this alters the direction that different pitch types move in
+
+# **Motivation**
+
+#### As can be seen in the GIFs below, it can be extremely difficult to distinguish between pitch types, even for experts, just by looking at the pitches with the naked eye. The GIFs below show each pitch type for Mike Leake of the Arizona Diamondbacks, controlling for venue (all pitches are from the Diamondbacks Home Stadium, Chase Field), camera angle, and batter handedness. 
+
+# **Goals of this Research**
+#### Some pitchers' pitch types are easier to distinguish than others without crucial factors like velocity, spin rate, and movement coefficients. Even having this information at their usage, many commentators and fans at games are left wondering what a pitch actually was after seeing it, which our project seeks to resolve. What are the main distinguishing metrics between pitch types? What are the characteristics of each pitch type? Our analysis below seeks to answer these questions.
+
+```{r, echo = FALSE, warning= FALSE, message = FALSE}
+set.seed(253)
+pitch_type_split <- initial_split(may_all_cleaned, prop = .7)
+pitch_type_train <- training(pitch_type_split)
+pitch_type_test <- testing(pitch_type_split)
+
+pitch_type_split_r <- initial_split(may_all_cleaned_r, prop = .7)
+pitch_type_train_r <- training(pitch_type_split_r)
+pitch_type_test_r <- testing(pitch_type_split_r)
+
+pitch_type_split_l <- initial_split(may_all_cleaned_l, prop = .7)
+pitch_type_train_l <- training(pitch_type_split_l)
+pitch_type_test_l <- testing(pitch_type_split_l)
+```
+
+```{r, echo = FALSE, warning= FALSE, message = FALSE}
+model_stats <- function(data, lev = NULL, model = NULL) {
+  
+  stats <- defaultSummary(data, lev = lev, model = model)
+  
+  transf_rmse <- function (pred, obs) {
+    sqrt(mean((exp(obs) - exp(pred))^2))
+  }
+  
+  trmse <- transf_rmse(pred = data$pred,
+                       obs = data$obs)
+  c(tRMSE = trmse, stats)
+}
+```
+
+```{r, echo = FALSE, warning= FALSE, message = FALSE}
+set.seed(2)
+
+km_pitchers_movement <- kmeans(x = pitch_type_train %>% select(pfx_x, pfx_z),
+                  centers = 6, #number of clusters
+                  nstart = 20 #see below,
+                
+)
+
+
+km_pitchers_movement_l <- kmeans(x = pitch_type_train_l %>% select(pfx_x, pfx_z),
+                  centers = 6, #number of clusters
+                  nstart = 20 #see below,
+                
+)
+
+km_pitchers_movement_r <- kmeans(x = pitch_type_train_r %>% select(pfx_x, pfx_z),
+                  centers = 6, #number of clusters
+                  nstart = 20 #see below,
+                
+)
+```
+
+# **Exploratory Plots**
+
+```{r, echo = FALSE}
+augment(km_pitchers_movement_l, data = pitch_type_train_l) %>% 
+  ggplot(aes(x= pfx_x, y= pfx_z, 
+             color= .cluster)) +
+  geom_point() +
+  labs(x = "Horizontal Movement (in.)", y = "Vertical Movement (in.)") +
+  ggtitle("Pitch Clusters for Left-Handed Pitcher (Using Just Movement)")
+```
+
+```{r, echo = FALSE}
+augment(km_pitchers_movement_r, data = pitch_type_train_r) %>% 
+  ggplot(aes(x= pfx_x, y= pfx_z, 
+             color= .cluster)) +
+  geom_point() +
+  labs(x = "Horizontal Movement (in.)", y = "Vertical Movement (in.)") +
+  ggtitle("Pitch Clusters for Right-Handed Pitcher (Using Just Movment)")
+```
+
+```{r}
+#augment(km_pitchers_movement_l, data = pitch_type_train_l) %>% 
+  #select(pitch_type, .cluster, release_speed) %>% 
+  #filter(.cluster == 5) %>% 
+  #mutate(Count = n()) %>% 
+  #group_by(pitch_type) %>% 
+  #mutate(PCT = n()/Count) %>% 
+  #arrange(desc(PCT)) %>% 
+  #rename(`Pitch Type` = pitch_type) %>% 
+  #distinct(`Pitch Type`, PCT) %>% 
+  #top_n(3)
+```
+
+```{r}
+may_all_cleaned %>% 
+  rename(`Pitcher Throws` = p_throws) %>% 
+  ggplot(aes(x = `Pitcher Throws`, fill = `Pitcher Throws`)) + 
+  geom_bar() +
+  labs(x = "Pitcher Side", y = "Total Number of Pitches Thrown in May 2019") +
+  ggtitle("Distribution of Pitches Thrown by Pitcher Handedness in May 2019")
+```
+
+#### The bar plot above exhibits the breakdown of pitches thrown in May 2019 by pitcher handedness. Using this graphic, it becomes clear that an overwhelmingly larger number of pitchers were delivered by righties than lefties. 
+
+```{r, echo=FALSE}
+may_all_cleaned %>%
+  group_by(pitch_type) %>%
+  summarise(avg_extension = mean(release_pos_y)) %>%
+  arrange(avg_extension) %>% 
+  rename(`Pitch Type` = pitch_type, `Average Extension (in)` = avg_extension)
+```
+
+```{r,echo= FALSE, fig.width=20, fig.height=10}
+    may_all_cleaned %>%
+      group_by(player_name, pitch_type) %>%
+      ggplot(aes(x = release_pos_x, y = release_pos_z, color = pitch_name)) +
+      geom_point() +
+      labs(x = "Horizontal Release Point Relative to Home Plate (in)", y = "Vertical Release Point Relative to Home Plate (in)") +
+      ggtitle("Release Points by Pitch Type") +
+        theme(text = element_text(size=20))
+```
+
+#### This plot shows us the release position from the home plate view of each pitch thrown. We can see that there is not enough of a difference to really be able to use this to predict pitch type, at least not without using a lot of other predictors. Most every pitch is thrown from every angle out there.
+
+
+
+```{r, fig.width=20, fig.height=10}
+may_all_cleaned %>% 
+  group_by(player_name, pitch_type) %>% 
+  mutate(AvgVelo = mean(release_speed)) %>% 
+  filter(pitch_type %in% c("FC", "FF", "FT", "SI")) %>% 
+  ggplot(aes(x = release_spin_rate, y = release_speed, color = pitch_name)) + 
+  geom_point() +
+  labs(x = "Spin Rate (RPM)", y = "Velocity (MPH)") +
+  ggtitle("Velocity by Spin Rate for Different Types of Fastballs")
+```
+
+#### This plot shows spin rate and velocity of all types of fastballs. Generally cutters are higher spin lower velocity, two seams tend to have lower spin and the biggest range of velocity, four seams are more in the middle but tend to be higher velocity. 
+
+```{r}
+may_all_cleaned %>%
+    group_by(player_name, pitch_type) %>%
+    mutate(AvgVelo = mean(release_speed)) %>%
+    ggplot(aes(x = pitch_name, y = AvgVelo)) +
+    geom_boxplot() +
+    labs(x = "Pitch Type", y = "Average Velocity (MPH)") +
+    ggtitle("Velocity by Pitch Type for MLB Pitchers in May 2019")
+```
+
+#### This plot shows the average velocity range of each pitch and can tell us that because there is enough of a difference that it is useful in predicting the pitch type. 
+
+
+
+
+
+
+
+
+
+
